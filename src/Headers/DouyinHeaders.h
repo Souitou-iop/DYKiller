@@ -858,6 +858,10 @@
 - (double)__bubbleYOrigin;
 @end
 
+// 消息列表底部的快速回底/新消息按钮容器视图（由 AWEIMBottomAnchorComponent 挂在 messageListVC.view 上）。
+@interface AWEIMBottomNewMessageTipsImageView : UIView
+@end
+
 // 普通聊天输入控制器。公司会话、POI 会话、作品详情与图文详情内的输入页复用同一套组件，
 // 由下面四个只读标志区分，功能只接管四者都为假的那一种。
 @interface IESIMInputViewController : UIViewController
@@ -1011,6 +1015,7 @@
 @property (nonatomic, strong) UIStackView *subtitleStackView;
 @end
 @interface AWEIMMessageListNaviBarTitleAvatarComponent : AWEIMComponentBase
+@property (nonatomic, strong) UIView *backgroundView;
 @property (nonatomic, strong) UIView *onlineDotView;
 - (void)p_updateDots;
 @end
@@ -1264,6 +1269,7 @@
 @interface AWEModernLongPressPanelUIConfig : NSObject
 + (UIColor *)cellHighlightedColor;
 + (UIColor *)itemTitleColor;
++ (UIColor *)itemIconColor;
 @end
 
 // 抖音列表框架：列表 VM 持有分区 VM，分区 VM 持有本分区的数据模型；评论长按面板基于它。

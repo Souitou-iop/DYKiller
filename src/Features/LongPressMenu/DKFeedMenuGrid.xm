@@ -162,6 +162,46 @@ static UIColor *DKFeedHighlightColor(void) {
     return [color isKindOfClass:UIColor.class] ? color : [UIColor colorWithWhite:0.5 alpha:0.15];
 }
 
+static UIColor *DKFeedIconColor(AWEModernLongPressHorizontalSettingItemCell *cell) {
+    if ([cell respondsToSelector:@selector(buttonLabel)] && cell.buttonLabel.textColor) {
+        return cell.buttonLabel.textColor;
+    }
+    Class config = NSClassFromString(@"AWEModernLongPressPanelUIConfig");
+    if ([config respondsToSelector:@selector(itemIconColor)]) {
+        id color = ((id (*)(id, SEL))objc_msgSend)(config, @selector(itemIconColor));
+        if ([color isKindOfClass:UIColor.class]) return color;
+    }
+    if ([config respondsToSelector:@selector(itemTitleColor)]) {
+        id color = ((id (*)(id, SEL))objc_msgSend)(config, @selector(itemTitleColor));
+        if ([color isKindOfClass:UIColor.class]) return color;
+    }
+    return nil;
+}
+
+// 现代横排格子：仅提供 iconImage 的菜单项（如「识别图片」「推荐」「后台小窗设置」「不感兴趣」）与原生列表行保持一致，
+// 转成 Template 渲染模式并跟随文字颜色（即 itemIconColor/itemTitleColor），使浅色/深色模式下图标颜色均跟随面板主题。
+static void DKFeedSyncModernCellIcon(AWEModernLongPressHorizontalSettingItemCell *cell, id viewModel) {
+    UIImageView *icon = [cell respondsToSelector:@selector(buttonIcon)] ? cell.buttonIcon : nil;
+    UIImage *image = [viewModel respondsToSelector:@selector(iconImage)]
+        ? ((AWELongPressPanelBaseViewModel *)viewModel).iconImage : nil;
+    if (![icon isKindOfClass:UIImageView.class] || ![image isKindOfClass:UIImage.class]) return;
+    UIColor *color = DKFeedIconColor(cell);
+    if (icon.contentMode != UIViewContentModeCenter && icon.contentMode != UIViewContentModeScaleAspectFit) {
+        icon.contentMode = UIViewContentModeCenter;
+    }
+    if (!icon.image || icon.image == image) {
+        if (color) {
+            icon.image = [image imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+            icon.tintColor = color;
+        } else if (!icon.image) {
+            icon.image = image;
+        }
+    } else if (color && icon.image.renderingMode == UIImageRenderingModeAlwaysTemplate
+               && ![icon.tintColor isEqual:color]) {
+        icon.tintColor = color;
+    }
+}
+
 @interface DKFeedGridTile : UIControl
 @property (nonatomic, strong) UIView *content;
 @property (nonatomic, strong) UIView *highlight;
@@ -205,7 +245,7 @@ static UIColor *DKFeedHighlightColor(void) {
 }
 
 // 半宽原生行：卡片底由外层画，自带的卡片底、分割线与右侧附件不显示。
-// 现代格子：只有 iconImage 的项（推荐、不感兴趣等）补上图标，去掉格子间的竖分割线。
+// 现代格子：只有 iconImage 的项（识别图片、推荐、不感兴趣等）补上图标并同步主题色，去掉格子间的竖分割线。
 - (void)dk_adjustContent {
     UIView *content = self.content;
     if ([content isKindOfClass:UITableViewCell.class]) {
@@ -218,10 +258,7 @@ static UIColor *DKFeedHighlightColor(void) {
     }
     AWEModernLongPressHorizontalSettingItemCell *cell = (AWEModernLongPressHorizontalSettingItemCell *)content;
     if ([cell respondsToSelector:@selector(setSeparatorHidden:)]) [cell setSeparatorHidden:YES];
-    UIImageView *icon = [cell respondsToSelector:@selector(buttonIcon)] ? cell.buttonIcon : nil;
-    UIImage *image = [self.viewModel respondsToSelector:@selector(iconImage)]
-        ? ((AWELongPressPanelBaseViewModel *)self.viewModel).iconImage : nil;
-    if ([icon isKindOfClass:UIImageView.class] && !icon.image && [image isKindOfClass:UIImage.class]) icon.image = image;
+    DKFeedSyncModernCellIcon(cell, self.viewModel);
 }
 
 - (void)dk_setViewModel:(id)model columns:(NSInteger)columns {
@@ -389,6 +426,15 @@ static void DKFeedGridTilesWillAppear(AWELongPressPanelTableViewController *cont
 %new
 - (BOOL)tableView:(UITableView *)tableView shouldHighlightRowAtIndexPath:(NSIndexPath *)indexPath {
     return DKFeedGridSectionFor(self, indexPath.section) == nil;
+}
+
+%end
+
+%hook AWEModernLongPressHorizontalSettingItemCell
+
+- (void)updateUI:(id)model {
+    %orig;
+    DKFeedSyncModernCellIcon(self, model);
 }
 
 %end

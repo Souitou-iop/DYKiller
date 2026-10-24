@@ -46,8 +46,11 @@ static DKChatTopSlot *DKChatTopSlotMake(UIView *source, CGRect frame, CGFloat ra
 @property (nonatomic, strong) NSHashTable<UIView *> *moved;
 @property (nonatomic, strong) NSMapTable<UIView *, NSNumber *> *clips;
 @property (nonatomic, weak) UIView *onlineDot;
+@property (nonatomic, weak) CALayer *notchLayer;
+@property (nonatomic, strong) CALayer *notchMask;
 - (void)reset;
 - (void)allowOverflow:(UIView *)view;
+- (void)clearNotchMask:(CALayer *)layer;
 - (void)move:(UIView *)view content:(CGRect)content to:(CGPoint)target scale:(CGFloat)scale carrier:(UIView *)carrier;
 @end
 @implementation DKChatTopLayout
@@ -58,7 +61,18 @@ static DKChatTopSlot *DKChatTopSlotMake(UIView *source, CGRect frame, CGFloat ra
     }
     return self;
 }
+- (void)clearNotchMask:(CALayer *)layer {
+    if (!layer || !layer.mask || self.notchLayer) return;
+    self.notchLayer = layer;
+    self.notchMask = layer.mask;
+    layer.mask = nil;
+}
 - (void)reset {
+    if (self.notchLayer && !self.notchLayer.mask && self.onlineDot && !self.onlineDot.hidden) {
+        self.notchLayer.mask = self.notchMask;
+    }
+    self.notchLayer = nil;
+    self.notchMask = nil;
     DKAdjustAlpha(self.onlineDot, 1.0);
     self.onlineDot = nil;
     for (UIView *view in self.moved) DKAdjustTransform(view, CGAffineTransformIdentity);
@@ -229,6 +243,32 @@ static DKChatTopPlace DKChatTopPlaceOfKey(NSString *key) {
 }
 
 // 返回贴左、通话与菜单贴右；头像居中放大，名称胶囊在下方，火花与在线按设置进名称胶囊或两侧胶囊。
+// 头像居中时在线圆点已被移到信息胶囊内或隐藏，清除原生在头像右下角掏洞的 notchLayer 遮罩；
+// 还原时在 reset 中按在线状态恢复。
+static void DKChatTopClearAvatarNotch(DKChatTopLayout *layout, UIView *avatar, UIView *dot) {
+    if (dot && dot.superview) {
+        for (UIView *sibling in dot.superview.subviews) {
+            if (sibling != dot && sibling.layer.mask) {
+                [layout clearNotchMask:sibling.layer];
+                return;
+            }
+        }
+    }
+    Class ringGradientCls = NSClassFromString(@"AFDColorRingGradientView");
+    NSMutableArray<UIView *> *queue = [NSMutableArray array];
+    if (avatar) [queue addObject:avatar];
+    while (queue.count) {
+        UIView *v = queue.firstObject;
+        [queue removeObjectAtIndex:0];
+        if (v == dot) continue;
+        if (v.layer.mask && (!ringGradientCls || ![v isKindOfClass:ringGradientCls])) {
+            [layout clearNotchMask:v.layer];
+            return;
+        }
+        [queue addObjectsFromArray:v.subviews];
+    }
+}
+
 static CGFloat DKChatTopCenterLayout(DKChatTopLayout *layout, AWENavigationBar *bar, UIView *carrier) {
     CGRect row = carrier.bounds;
     CGFloat height = CGRectGetHeight(row);
@@ -273,6 +313,7 @@ static CGFloat DKChatTopCenterLayout(DKChatTopLayout *layout, AWENavigationBar *
     CGFloat dotGap = dotSide > 0.0 ? kDKChatTopGap * 0.5 : 0.0;
     layout.onlineDot = dot;
     DKAdjustAlpha(dot, online ? 1.0 : 0.0);
+    DKChatTopClearAvatarNotch(layout, avatar, dot);
 
     DKChatTopCenterSpec spec = {0};
     spec.row = row;
@@ -387,6 +428,8 @@ void DKChatTopBarSync(UIView *view) {
             [layout reset];
             objc_setAssociatedObject(bar, &kDKChatTopLayoutKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             [DKChatGlassStore removeStoreForOwner:bar];
+            DKAdjustAlpha(bar.bottomLineView, 1.0);
+            bar.bottomLineView.hidden = NO;
             DKChatTopBlurSync(bar, nil, 0.0, UIUserInterfaceStyleUnspecified, NO);
             DKChatTopApplyExtra(host, 0.0);
             return;
@@ -407,6 +450,8 @@ void DKChatTopBarSync(UIView *view) {
             [store clearBackingOfView:bar];
             [store clearBackingOfView:carrier];
             [store clearBackingOfView:bar.bottomLineView];
+            DKAdjustAlpha(bar.bottomLineView, 0.0);
+            bar.bottomLineView.hidden = YES;
             CGFloat carrierBottom = DKChatTopCentered() ? DKChatTopCenterLayout(layout, bar, carrier)
                                                         : DKChatTopDefaultLayout(layout, bar, carrier);
             bottom = [carrier convertPoint:CGPointMake(0.0, carrierBottom) toView:bar].y;
@@ -497,12 +542,27 @@ static DKChatTopSlot *DKChatTopSlotAtPoint(AWENavigationBar *bar, CGPoint point)
     return nil;
 }
 
-// 玻璃放在滚动列表后方，原生 cell 复用与过渡快照只承载内容。
+// 玻璃放在滚动列表后方，原生 cell 复用与过渡快照只承载内容；仅隐藏底边细线，保留垫入的玻璃卡片。
 static void DKChatGroupBarSync(UIView *bar, UICollectionViewCell *pendingCell) {
     if (@available(iOS 26.0, *)) {
         UIViewController *input = DKChatInputControllerForPageView(bar);
         if (!DKChatInputGlassWanted(input) || DKPrefBool(DKKeyChatRemoveMenu) || !DKChatTopVisible(bar)) {
             [DKChatGlassStore removeStoreForOwner:bar];
+            for (UIView *child in bar.subviews) {
+                if (![child isKindOfClass:UICollectionView.class] && ![child isKindOfClass:UIVisualEffectView.class]) {
+                    CGFloat childH = MAX(CGRectGetHeight(child.bounds), CGRectGetHeight(child.frame));
+                    if (childH <= 2.0) {
+                        DKAdjustAlpha(child, 1.0);
+                        child.hidden = NO;
+                    }
+                }
+            }
+            for (CALayer *sublayer in bar.layer.sublayers) {
+                if (CGRectGetHeight(sublayer.frame) <= 2.0) {
+                    sublayer.hidden = NO;
+                    sublayer.opacity = 1.0;
+                }
+            }
             return;
         }
         DKChatGlassStore *store = [DKChatGlassStore storeForOwner:bar create:YES];
@@ -510,18 +570,72 @@ static void DKChatGroupBarSync(UIView *bar, UICollectionViewCell *pendingCell) {
         [store beginWithClear:DKPrefBool(DKKeyChatInputGlassClear) style:DKChatInputStyle(input)];
         [UIView performWithoutAnimation:^{
             [store clearBackingOfView:bar];
+            if (bar.layer.borderWidth > 0.0) bar.layer.borderWidth = 0.0;
+            for (CALayer *sublayer in bar.layer.sublayers.copy) {
+                if (sublayer.delegate && [bar.subviews containsObject:(id)sublayer.delegate]) continue;
+                if (CGRectGetHeight(sublayer.frame) <= 2.0 && CGRectGetHeight(sublayer.frame) > 0.0) {
+                    sublayer.hidden = YES;
+                    sublayer.opacity = 0.0;
+                }
+            }
+            for (NSString *prop in @[ @"bottomLineView", @"separatorLine", @"lineView", @"bottomLine", @"separateLineView" ]) {
+                if ([bar respondsToSelector:NSSelectorFromString(prop)]) {
+                    UIView *line = [bar valueForKey:prop];
+                    if (line && [line isKindOfClass:UIView.class]) {
+                        [store clearBackingOfView:line];
+                        DKAdjustAlpha(line, 0.0);
+                        line.hidden = YES;
+                    }
+                }
+            }
             for (UIView *child in bar.subviews.copy) {
-                if (![child isKindOfClass:UICollectionView.class]) continue;
-                [store clearBackingOfView:child];
-                NSMutableArray *cells = [((UICollectionView *)child).visibleCells mutableCopy];
+                // 垫入的玻璃卡片（DKGlassFlexView 是 UIVisualEffectView）绝对不能清底色或隐藏
+                if ([child isKindOfClass:UIVisualEffectView.class]) {
+                    DKAdjustAlpha(child, 1.0);
+                    child.hidden = NO;
+                    child.alpha = 1.0;
+                    continue;
+                }
+                if (![child isKindOfClass:UICollectionView.class]) {
+                    [store clearBackingOfView:child];
+                    CGFloat childH = MAX(CGRectGetHeight(child.bounds), CGRectGetHeight(child.frame));
+                    if (childH <= 2.0 && childH > 0.0) {
+                        DKAdjustAlpha(child, 0.0);
+                        child.hidden = YES;
+                    }
+                    continue;
+                }
+                UICollectionView *collectionView = (UICollectionView *)child;
+                [store clearBackingOfView:collectionView];
+                if ([collectionView respondsToSelector:@selector(backgroundView)] && collectionView.backgroundView) {
+                    [store clearBackingOfView:collectionView.backgroundView];
+                    DKAdjustAlpha(collectionView.backgroundView, 0.0);
+                    collectionView.backgroundView.hidden = YES;
+                }
+                for (UIView *sub in collectionView.subviews) {
+                    if (![sub isKindOfClass:UICollectionViewCell.class] && ![sub isKindOfClass:UIVisualEffectView.class]) {
+                        CGFloat subH = MAX(CGRectGetHeight(sub.bounds), CGRectGetHeight(sub.frame));
+                        if (subH <= 2.0 && subH > 0.0) {
+                            [store clearBackingOfView:sub];
+                            DKAdjustAlpha(sub, 0.0);
+                            sub.hidden = YES;
+                        }
+                    }
+                }
+                NSMutableArray *cells = [collectionView.visibleCells mutableCopy];
                 if (pendingCell.superview == child && ![cells containsObject:pendingCell]) [cells addObject:pendingCell];
                 for (UICollectionViewCell *cell in cells) {
                     if (!DKChatTopVisible(cell)) continue;
                     [store clearBackingOfView:cell];
                     [store clearBackingOfView:cell.contentView];
                     CGRect frame = [cell.contentView convertRect:cell.contentView.bounds toView:bar];
-                    [store placeGlassFor:cell in:bar frame:frame shape:DKChatGlassShapeRounded
-                                 radius:CGRectGetHeight(frame) * 0.5 interactive:YES tint:nil];
+                    UIVisualEffectView *glass = [store placeGlassFor:cell in:bar frame:frame shape:DKChatGlassShapeRounded
+                                                              radius:CGRectGetHeight(frame) * 0.5 interactive:YES tint:nil];
+                    if (glass) {
+                        DKAdjustAlpha(glass, 1.0);
+                        glass.hidden = NO;
+                        glass.alpha = 1.0;
+                    }
                 }
             }
         }];
@@ -607,6 +721,13 @@ static void DKChatTopPageSync(UIViewController *host) {
 // 火花提示动画与在线文字变化只重排标题栈，不一定经过导航布局。
 %hook AWEIMMessageListNaviBarTitleView
 - (void)layoutSubviews { %orig; DKChatTopSyncAncestorBar(self); }
+%end
+// 在线状态变化时原生会重设 onlineDotView.hidden 与 contentView.layer.mask。
+%hook AWEIMMessageListNaviBarTitleAvatarComponent
+- (void)p_updateDots {
+    %orig;
+    DKChatTopSyncAncestorBar(self.backgroundView);
+}
 %end
 %hook DKChatGroupEntryBar
 - (void)collectionView:(UICollectionView *)collectionView didSelectItemAtIndexPath:(NSIndexPath *)path {

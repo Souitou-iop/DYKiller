@@ -4,24 +4,65 @@
 //
 //  原生布局读取当前几何并写回列表容器、表格与 inset。每轮快照计算前撤掉本模块的延伸，
 //  布局后将列表上沿延伸到物理顶部，非键盘态再延伸到底部；inset 与 offset 同步补偿。
-//  居中头像加高顶部区域时，top inset 再让出加高量。按列表上沿定位的未读提示补回上沿延伸与让位量。
+//  居中头像加高顶部区域时，top inset 再让出加高量。按列表上沿定位的未读提示补回上沿延伸与让位量；
+//  按列表下沿定位的底部快速回底/新消息按钮扣除下沿延伸量，保持停在输入区上方。
 //
 
 #import "DKChatInputList.h"
 #import "DKChatInput.h"
+#import "DKChatGlassStore.h"
+#import "DKChatInputLayout.h"
 #import "DKChatTopBar.h"
+#import "DKKeys.h"
+#import "DKUtils.h"
 #import "DKGlassGuard.h"
 #import "DouyinHeaders.h"
+#import <math.h>
 #import <objc/runtime.h>
 
 // 系统键盘输入形态，键盘弹出时列表保持原生（止于输入行上沿）。
 static const long long kDKChatInputTypeKeyboard = 1;
+static const CGFloat kDKChatBottomTipsMargin = 16.0;
 
 static char kDKChatListExtensionKey;    // 表格上记本模块加上的延伸量
 static char kDKChatListTopExtensionKey;
 static char kDKChatListTopPadKey;
 static char kDKChatListNativeLayoutKey;
 static NSHashTable *gDKChatListComponents;
+static NSHashTable *gDKChatBottomTipsViews;
+static char kDKTipsShadowOpacityKey;
+
+static void DKChatBottomTipsSync(AWEIMBottomNewMessageTipsImageView *view) {
+    if (!view) return;
+    if (!gDKChatBottomTipsViews) gDKChatBottomTipsViews = [NSHashTable weakObjectsHashTable];
+    [gDKChatBottomTipsViews addObject:view];
+    if (@available(iOS 26.0, *)) {
+        UIViewController *input = DKChatInputControllerForPageView(view);
+        if (!DKChatInputGlassWanted(input) || !view.window || CGRectIsEmpty(view.bounds)) {
+            [DKChatGlassStore removeStoreForOwner:view];
+            NSNumber *shadow = objc_getAssociatedObject(view, &kDKTipsShadowOpacityKey);
+            if (shadow) {
+                view.layer.shadowOpacity = shadow.floatValue;
+                objc_setAssociatedObject(view, &kDKTipsShadowOpacityKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
+            return;
+        }
+        DKChatGlassStore *store = [DKChatGlassStore storeForOwner:view create:YES];
+        if (store.syncing) return;
+        BOOL clear = DKPrefBool(DKKeyChatInputGlassClear);
+        UIUserInterfaceStyle style = DKChatInputStyle(input);
+        [store beginWithClear:clear style:style];
+        [store clearBackingOfView:view];
+        if (view.layer.shadowOpacity > 0.0) {
+            objc_setAssociatedObject(view, &kDKTipsShadowOpacityKey, @(view.layer.shadowOpacity), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            view.layer.shadowOpacity = 0.0;
+        }
+        CGFloat radius = CGRectGetHeight(view.bounds) * 0.5;
+        [store placeGlassFor:view in:view frame:view.bounds shape:DKChatGlassShapeRounded
+                     radius:radius interactive:YES tint:nil];
+        [store end];
+    }
+}
 
 // 布局组件所在聊天页的消息表格与裁剪它的列表容器；结构不符时返回 nil。
 static UITableView *DKChatListTable(id component, UIView **container) {
@@ -33,6 +74,22 @@ static UITableView *DKChatListTable(id component, UIView **container) {
     if (table.superview != list.view || list.view.superview != host.view) return nil;
     *container = list.view;
     return table;
+}
+
+static UIView *DKChatListBottomTipsView(UIView *container) {
+    for (UIView *subview in container.subviews) {
+        if (DKChatInputIsKind(subview, @"AWEIMBottomNewMessageTipsImageView")) return subview;
+    }
+    return nil;
+}
+
+static CGFloat DKChatListBottomExtensionForContainer(UIView *container) {
+    for (UIView *subview in container.subviews) {
+        if (![subview isKindOfClass:UITableView.class]) continue;
+        CGFloat extension = [objc_getAssociatedObject(subview, &kDKChatListExtensionKey) doubleValue];
+        if (extension > 0.0) return extension;
+    }
+    return 0.0;
 }
 
 static BOOL DKChatListWanted(id component) {
@@ -76,6 +133,12 @@ static void DKChatListShiftTop(UIView *container, UITableView *table, CGFloat de
     table.contentInset = inset;
     table.verticalScrollIndicatorInsets = indicator;
     table.contentOffset = offset;
+    UIView *tips = DKChatListBottomTipsView(container);
+    if (tips) {
+        CGRect tipsFrame = tips.frame;
+        tipsFrame.origin.y += delta;
+        tips.frame = tipsFrame;
+    }
 }
 
 // 只加 top inset、不动 frame：停在顶端时仍停在顶端，其余位置的消息不移动。
@@ -139,6 +202,9 @@ void DKChatInputListRefresh(void) {
         DKChatListCollapse(container, table);
         DKChatListExtend(component, container, table);
     }
+    for (AWEIMBottomNewMessageTipsImageView *tips in gDKChatBottomTipsViews.allObjects) {
+        DKChatBottomTipsSync(tips);
+    }
 }
 
 // 原生在动画块里写 frame / contentOffset 时，UIKit 按属性追加增量动画（position、bounds.size、bounds.origin，
@@ -167,8 +233,11 @@ static void DKChatListNativeLayout(id component, void (^nativeLayout)(void)) {
     UIView *container = nil;
     UITableView *table = DKChatInputController(component) ? DKChatListTable(component, &container) : nil;
     if (!table) { nativeLayout(); return; }
+    UIView *tips = DKChatListBottomTipsView(container);
     dispatch_block_t sweepContainer = DKChatListTransientAnimationSweeper(container.layer);
     dispatch_block_t sweepTable = DKChatListTransientAnimationSweeper(table.layer);
+    dispatch_block_t sweepTips = nil;
+    if (tips) sweepTips = DKChatListTransientAnimationSweeper(tips.layer);
     objc_setAssociatedObject(component, &kDKChatListNativeLayoutKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     [UIView performWithoutAnimation:^{ DKChatListCollapse(container, table); }];
     DKChatTopBarNativeLayout(((AWEIMComponentBase *)component).context.hostViewController, nativeLayout);
@@ -179,6 +248,7 @@ static void DKChatListNativeLayout(id component, void (^nativeLayout)(void)) {
     if (DKChatInputGlassWanted(DKChatInputController(component))) {
         sweepContainer();
         sweepTable();
+        if (sweepTips) sweepTips();
     }
 }
 
@@ -205,10 +275,36 @@ static CGFloat DKChatListTopExtension(id component) {
     return %orig + DKChatListTopExtension(self);
 }
 %end
+// 底部快速回底/新消息按钮在 showBottomTips / hideBottomTips / 旋转时直接取列表视图高度（含底部延伸量），
+// 扣除底部延伸量使其停在输入区上方 16pt 处。
+%hook AWEIMBottomNewMessageTipsImageView
+- (void)setFrame:(CGRect)frame {
+    UIView *container = self.superview;
+    CGFloat extension = container ? DKChatListBottomExtensionForContainer(container) : 0.0;
+    if (extension > 0.0) {
+        CGFloat containerHeight = CGRectGetHeight(container.bounds);
+        CGFloat shownTop = containerHeight - kDKChatBottomTipsMargin - CGRectGetHeight(frame);
+        if (fabs(frame.origin.y - shownTop) < 1.0 || fabs(frame.origin.y - containerHeight) < 1.0) {
+            frame.origin.y -= extension;
+        }
+    }
+    %orig(frame);
+    DKChatBottomTipsSync(self);
+}
+- (void)layoutSubviews {
+    %orig;
+    DKChatBottomTipsSync(self);
+}
+- (void)didMoveToWindow {
+    %orig;
+    DKChatBottomTipsSync(self);
+}
+%end
 %end
 
 %ctor {
     gDKChatListComponents = [NSHashTable weakObjectsHashTable];
+    gDKChatBottomTipsViews = [NSHashTable weakObjectsHashTable];
     if (DKGlassOSAvailable()) {
         %init(DKChatInputListHooks);
     }
